@@ -125,7 +125,7 @@ class AIMEBenchmarker(Benchmarker):
         return create_simple_sgl_function(
             function_name="reasoning_gen",
             answer_key="answer",
-            user_prefix="\nPlease reason step by step, and put your final answer within \\boxed{}.",
+            user_suffix="\nPlease reason step by step, and put your final answer within \\boxed{}.",
         )
 
     def get_max_new_tokens(self) -> int:

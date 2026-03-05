@@ -133,9 +133,10 @@ def create_simple_sgl_function(
     function_name: str = "get_answer",
     answer_key: str = "answer",
     system_prompt: Optional[str] = None,
-    max_tokens: int = 2048,
+    max_tokens: Optional[int] = None,
     stop: Optional[List[str]] = None,
     user_prefix: Optional[str] = None,
+    user_suffix: Optional[str] = None,
 ) -> Callable:
     """
     Create a simple SGL function for single-turn Q&A.
@@ -146,7 +147,8 @@ def create_simple_sgl_function(
         system_prompt: Optional system prompt
         max_tokens: Maximum tokens to generate
         stop: Optional stop sequences
-        user_prefix: Optional suffix to append to user message (appended after question)
+        user_prefix: Optional prefix to prepend to user message (prepended before question)
+        user_suffix: Optional suffix to append to user message (appended after question)
 
     Returns:
         SGL function decorated with @sgl.function
@@ -158,9 +160,13 @@ def create_simple_sgl_function(
             s += sgl.system(system_prompt)
         user_content = question
         if user_prefix:
-            user_content = question + user_prefix
+            user_content = user_prefix + user_content
+        if user_suffix:
+            user_content = user_content + user_suffix
         s += sgl.user(user_content)
-        gen_kwargs = {"max_tokens": max_tokens}
+        gen_kwargs = {}
+        if max_tokens:
+            gen_kwargs["max_tokens"] = max_tokens
         if stop:
             gen_kwargs["stop"] = stop
         s += sgl.assistant(sgl.gen(answer_key, **gen_kwargs))

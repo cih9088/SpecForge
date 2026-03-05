@@ -231,7 +231,7 @@ def launch_sglang_server(
 
     default_sglang_args = ServerArgs("dummy")
     for k, v in asdict(server_args).items():
-        if k == "model_path":
+        if k in ("model_path", "speculative_draft_model_path"):
             continue
         argument_name = f"--{k.replace('_', '-')}"
         if (
@@ -386,7 +386,7 @@ def main():
         batch_size = configs[0][0] if len(configs) > 0 else 8
         run_benchmarks(batch_size, None, None, None)
     else:
-        base_url = f"http://localhost:{args.port}"
+        base_url = f"http://127.0.0.1:{args.port}"
         # we itearate over each config from args
         for batch_size, steps, topk, num_draft_tokens in configs:
             process = launch_sglang_server(

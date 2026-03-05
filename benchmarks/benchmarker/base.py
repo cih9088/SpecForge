@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from argparse import Namespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from faker import Faker
 from sglang import set_default_backend
 from sglang.test.test_utils import select_sglang_backend
 
@@ -36,6 +37,21 @@ class Benchmarker(ABC):
     ):
         self.num_samples = num_samples
         self.subset = subset
+        self.isl: Optional[int] = None
+        self.faker = Faker()
+        self.faker.seed_instance(42)
+
+    def set_isl(self, isl: int):
+        self.isl = isl
+
+    def fill_isl(self, prompt: str):
+        if self.isl is None:
+            return prompt
+        # NOTE: heuristic based on meta-llama/Llama-3.1-8B-Instruct tokenizer
+        residual = self.isl * 6 - len(prompt)
+        if residual <= 0:
+            return prompt
+        return f"<ignore-this-block>\n{self.faker.text(residual)}\n</ignore-this-block>\n\n{prompt}"
 
     @abstractmethod
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[Any]]:
@@ -143,6 +159,11 @@ class Benchmarker(ABC):
         if len(questions) == 0:
             print("No valid questions found. Please check the dataset format.")
             return
+        if self.isl is not None:
+            questions = [
+                {"question": self.fill_isl(question["question"])}
+                for question in questions
+            ]
 
         # Create SGL function
         sgl_function = self.create_sgl_function()

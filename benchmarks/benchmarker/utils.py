@@ -16,6 +16,8 @@ class BenchmarkMetrics:
     latency: float
     output_throughput: float
     accept_length: float
+    avg_num_input_tokens: float
+    avg_num_output_tokens: float
     accuracy: Optional[float] = None
     num_questions: int = 0
     num_valid_predictions: int = 0
@@ -52,6 +54,13 @@ def compute_metrics(
             s.get_meta_info(answer_key)["completion_tokens"] for s in states
         )
 
+    avg_num_output_tokens = num_output_tokens / len(states)
+
+    num_input_tokens = sum(
+        s.get_meta_info(answer_key).get("prompt_tokens", 0) for s in states
+    )
+    avg_num_input_tokens = num_input_tokens / len(states)
+
     output_throughput = num_output_tokens / latency if latency > 0 else 0.0
 
     # Compute accept length (speculative decoding metric)
@@ -80,6 +89,8 @@ def compute_metrics(
         output_throughput=output_throughput,
         accept_length=accept_length,
         num_questions=len(states),
+        avg_num_input_tokens=avg_num_input_tokens,
+        avg_num_output_tokens=avg_num_output_tokens,
     )
 
 

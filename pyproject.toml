@@ -27,6 +27,7 @@ dependencies = [
     "ninja",
     "packaging",
     "yunchang",
+    "faker",
 ]
 
 [tool.setuptools]

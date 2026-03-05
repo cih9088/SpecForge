@@ -46,7 +46,7 @@ import json
 import os
 import time
 from dataclasses import asdict
-from typing import List
+from typing import List, Optional
 
 import requests
 from benchmarker import BENCHMARKS
@@ -94,6 +94,13 @@ def parse_args():
         "--enable-multi-turn-conversation",
         action="store_true",
         default=False,
+    )
+    benchmark_group.add_argument(
+        "--isl-list",
+        type=int,
+        nargs="+",
+        default=[None],
+        help="target input sequence length",
     )
     return parser.parse_args()
 
@@ -180,6 +187,7 @@ def main():
     args = parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
     configs = [tuple(map(int, config.split(","))) for config in args.config_list]
+    isls = args.isl_list
 
     # split the arg into list of (bench_name, num_prompts)
     benchmark_list = []
@@ -200,43 +208,54 @@ def main():
         benchmark_list.append((bench_name, num_prompts, subset))
     assert len(benchmark_list) != 0, "the number of benchmark list is 0"
 
-    base_url = f"http://localhost:{args.port}"
-
     results = {}
     results["model"] = server_args.speculative_draft_model_path
 
-    def run_benchmarks(batch_size: int, steps: int, topk: int, num_draft_tokens: int):
+    def run_benchmarks(
+        batch_size: int,
+        steps: Optional[int],
+        topk: Optional[int],
+        num_draft_tokens: Optional[int],
+    ):
         for benchmark_name, num_prompts, subset in benchmark_list:
-            print(
-                f"Running benchmark {benchmark_name} with {num_prompts} prompts, batch size {batch_size}, steps {steps}, topk {topk}, num_draft_tokens {num_draft_tokens}, subset {subset}"
-            )
-            benchmarkder_cls = BENCHMARKS.get(benchmark_name)
-            num_prompts = int(num_prompts) if num_prompts is not None else None
-            if subset is None:
-                benchmarker = benchmarkder_cls(num_samples=num_prompts)
-            else:
-                benchmarker = benchmarkder_cls(num_samples=num_prompts, subset=subset)
-            metrics_list = benchmarker.run(
-                host=args.host, port=args.port, batch_size=batch_size
-            )
-            send_flush_cache_request(base_url)
-            if benchmark_name not in results:
-                results[benchmark_name] = []
-            results[benchmark_name].append(
-                dict(
-                    batch_size=batch_size,
-                    steps=steps,
-                    topk=topk,
-                    num_draft_tokens=num_draft_tokens,
-                    metrics=[asdict(metric) for metric in metrics_list],
-                    num_samples=num_prompts,
+            for isl in isls:
+                print(
+                    f"Running benchmark {benchmark_name} with {num_prompts} prompts, "
+                    f"batch size {batch_size}, steps {steps}, topk {topk}, "
+                    f"num_draft_tokens {num_draft_tokens}, subset {subset}, isl {isl}"
                 )
-            )
+                benchmarkder_cls = BENCHMARKS.get(benchmark_name)
+                num_prompts = int(num_prompts) if num_prompts is not None else None
+                if subset is None:
+                    benchmarker = benchmarkder_cls(num_samples=num_prompts)
+                else:
+                    benchmarker = benchmarkder_cls(
+                        num_samples=num_prompts, subset=subset
+                    )
+                benchmarker.set_isl(isl)
+                metrics_list = benchmarker.run(
+                    host=args.host, port=args.port, batch_size=batch_size
+                )
+                send_flush_cache_request(f"http://{args.host}:{args.port}")
+                if benchmark_name not in results:
+                    results[benchmark_name] = []
+                results[benchmark_name].append(
+                    dict(
+                        isl=isl,
+                        batch_size=batch_size,
+                        steps=steps,
+                        topk=topk,
+                        num_draft_tokens=num_draft_tokens,
+                        metrics=[asdict(metric) for metric in metrics_list],
+                        num_samples=num_prompts,
+                    )
+                )
 
     if args.skip_launch_server:
         batch_size = configs[0][0] if len(configs) > 0 else 8
         run_benchmarks(batch_size, None, None, None)
     else:
+        base_url = f"http://localhost:{args.port}"
         # we itearate over each config from args
         for batch_size, steps, topk, num_draft_tokens in configs:
             process = launch_sglang_server(

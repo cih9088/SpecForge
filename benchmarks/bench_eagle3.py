@@ -44,15 +44,40 @@ python bench_eagle3.py \
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
 from typing import List, Optional
 
 import requests
 from benchmarker import BENCHMARKS
+from sglang.lang.chat_template import ChatTemplate, register_chat_template
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import kill_process_tree, popen_launch_server
 from sglang.utils import wait_for_server
+
+register_chat_template(
+    ChatTemplate(
+        name="k-exaone",
+        default_system_prompt="You are K-EXAONE, a large language model developed by LG AI Research in South Korea, built to serve as a helpful and reliable assistant.",
+        role_prefix_and_suffix={
+            "system": ("<|system|>\n", "<|endofturn|>\n"),
+            "user": ("<|user|>\n", "<|endofturn|>\n"),
+            "assistant": ("<|assistant|>\n<think>\n", "<|endofturn|>\n"),
+        },
+    )
+)
+register_chat_template(
+    ChatTemplate(
+        name="k-exaone-no-think",
+        default_system_prompt="You are K-EXAONE, a large language model developed by LG AI Research in South Korea, built to serve as a helpful and reliable assistant.",
+        role_prefix_and_suffix={
+            "system": ("<|system|>\n", "<|endofturn|>\n"),
+            "user": ("<|user|>\n", "<|endofturn|>\n"),
+            "assistant": ("<|assistant|>\n<think>\n\n</think>\n\n", "<|endofturn|>\n"),
+        },
+    )
+)
 
 
 def parse_args():
@@ -102,6 +127,54 @@ def parse_args():
         default=[None],
         help="target input sequence length",
     )
+    benchmark_group.add_argument(
+        "--spec-algo",
+        type=str,
+        default="EAGLE3",
+        help="algorithm to use for speculative decoding",
+    )
+    benchmark_group.add_argument(
+        "--save-history",
+        action="store_true",
+    )
+    benchmark_group.add_argument(
+        "--frontend-chat-template-name",
+        type=str,
+        default=None,
+    )
+
+    parameter_group = parser.add_argument_group("parameter")
+    parameter_group.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+    )
+    parameter_group.add_argument(
+        "--temperature",
+        type=float,
+        default=0,
+    )
+    parameter_group.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+    )
+    parameter_group.add_argument(
+        "--top-k",
+        type=int,
+        default=-1,
+    )
+    parameter_group.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=0.0,
+    )
+    parameter_group.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=0.0,
+    )
+
     return parser.parse_args()
 
 
@@ -112,6 +185,7 @@ def launch_sglang_server(
     steps: int,
     topk: int,
     num_draft_tokens: int,
+    spec_algo: str,
     timeout: int,
 ):
     """
@@ -122,17 +196,22 @@ def launch_sglang_server(
         sglang_args.extend(
             [
                 "--speculative-algorithm",
-                "EAGLE3",
+                spec_algo,
                 "--speculative-num-steps",
                 str(steps),
                 "--speculative-eagle-topk",
                 str(topk),
                 "--speculative-num-draft-tokens",
                 str(num_draft_tokens),
-                "--speculative-draft-model-path",
-                server_args.speculative_draft_model_path,
             ]
         )
+        if server_args.speculative_draft_model_path:
+            sglang_args.extend(
+                [
+                    "--speculative-draft-model-path",
+                    server_args.speculative_draft_model_path,
+                ]
+            )
 
     sglang_args.extend(
         [
@@ -147,23 +226,23 @@ def launch_sglang_server(
         ]
     )
 
-    if server_args.trust_remote_code:
-        sglang_args.extend(["--trust-remote-code"])
+    presented = [a for a in sys.argv[1:] if a.startswith("--")]
+    exists = set(sglang_args[::2])
 
-    if server_args.disable_radix_cache:
-        sglang_args.extend(["--disable-radix-cache"])
-
-    if server_args.ep_size:
-        sglang_args.extend(["--ep-size", str(server_args.ep_size)])
-
-    if server_args.attention_backend:
-        sglang_args.extend(["--attention-backend", server_args.attention_backend])
-
-    if server_args.quantization:
-        sglang_args.extend(["--quantization", server_args.quantization])
-
-    if server_args.dtype:
-        sglang_args.extend(["--dtype", server_args.dtype])
+    default_sglang_args = ServerArgs("dummy")
+    for k, v in asdict(server_args).items():
+        if k == "model_path":
+            continue
+        argument_name = f"--{k.replace('_', '-')}"
+        if (
+            v != getattr(default_sglang_args, k)
+            and argument_name not in exists
+            and argument_name in presented
+        ):
+            if isinstance(v, bool):
+                sglang_args.extend([argument_name])
+            else:
+                sglang_args.extend([argument_name, str(v)])
 
     process = popen_launch_server(
         server_args.model_path,
@@ -210,6 +289,24 @@ def main():
 
     results = {}
     results["model"] = server_args.speculative_draft_model_path
+    results["parameter"] = dict(
+        frontend_chat_template_name=args.frontend_chat_template_name,
+        temeprature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        frequence_penalty=args.frequency_penalty,
+        presence_penalty=args.presence_penalty,
+    )
+    results_history = {}
+    results_history["model"] = server_args.speculative_draft_model_path
+    results_history["parameter"] = dict(
+        frontend_chat_template_name=args.frontend_chat_template_name,
+        temeprature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        frequence_penalty=args.frequency_penalty,
+        presence_penalty=args.presence_penalty,
+    )
 
     def run_benchmarks(
         batch_size: int,
@@ -219,12 +316,21 @@ def main():
     ):
         for benchmark_name, num_prompts, subset in benchmark_list:
             for isl in isls:
+                if isl == 0:
+                    isl = None
                 print(
                     f"Running benchmark {benchmark_name} with {num_prompts} prompts, "
                     f"batch size {batch_size}, steps {steps}, topk {topk}, "
                     f"num_draft_tokens {num_draft_tokens}, subset {subset}, isl {isl}"
                 )
                 benchmarkder_cls = BENCHMARKS.get(benchmark_name)
+                if args.max_new_tokens is not None:
+
+                    def _get_max_new_tokens(self):
+                        return args.max_new_tokens
+
+                    benchmarkder_cls.get_max_new_tokens = _get_max_new_tokens
+
                 num_prompts = int(num_prompts) if num_prompts is not None else None
                 if subset is None:
                     benchmarker = benchmarkder_cls(num_samples=num_prompts)
@@ -233,8 +339,17 @@ def main():
                         num_samples=num_prompts, subset=subset
                     )
                 benchmarker.set_isl(isl)
-                metrics_list = benchmarker.run(
-                    host=args.host, port=args.port, batch_size=batch_size
+                histories_list, metrics_list = benchmarker.run(
+                    host=args.host,
+                    port=args.port,
+                    batch_size=batch_size,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    frequency_penalty=args.frequency_penalty,
+                    presence_penalty=args.presence_penalty,
+                    chat_template_name=args.frontend_chat_template_name,
+                    reasoning_parser=args.reasoning_parser,
                 )
                 send_flush_cache_request(f"http://{args.host}:{args.port}")
                 if benchmark_name not in results:
@@ -242,6 +357,7 @@ def main():
                 results[benchmark_name].append(
                     dict(
                         isl=isl,
+                        max_new_tokens=benchmarker.get_max_new_tokens(),
                         batch_size=batch_size,
                         steps=steps,
                         topk=topk,
@@ -250,6 +366,21 @@ def main():
                         num_samples=num_prompts,
                     )
                 )
+                if args.save_history:
+                    if benchmark_name not in results_history:
+                        results_history[benchmark_name] = []
+                    results_history[benchmark_name].append(
+                        dict(
+                            isl=isl,
+                            max_new_tokens=benchmarker.get_max_new_tokens(),
+                            batch_size=batch_size,
+                            steps=steps,
+                            topk=topk,
+                            num_draft_tokens=num_draft_tokens,
+                            histories=histories_list,
+                            num_samples=num_prompts,
+                        )
+                    )
 
     if args.skip_launch_server:
         batch_size = configs[0][0] if len(configs) > 0 else 8
@@ -265,6 +396,7 @@ def main():
                 steps,
                 topk,
                 num_draft_tokens,
+                args.spec_algo,
                 args.timeout_for_server_launch,
             )
             wait_for_server(base_url)
@@ -281,6 +413,15 @@ def main():
     with open(result_file, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {result_file}")
+
+    if args.save_history:
+        history_file = os.path.join(
+            args.output_dir,
+            f"{args.name + '_' if args.name else ''}histories_{timestamp}.jsonl",
+        )
+        with open(history_file, "w") as f:
+            json.dump(results_history, f, indent=4)
+        print(f"Histories saved to {history_file}")
 
 
 if __name__ == "__main__":

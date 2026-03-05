@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from faker import Faker
 from sglang import set_default_backend
+from sglang.lang.chat_template import get_chat_template
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.test_utils import select_sglang_backend
 
 from .utils import compute_metrics
@@ -126,8 +128,16 @@ class Benchmarker(ABC):
         host: str,
         port: int,
         batch_size: int,
-        max_new_tokens: int = None,
+        max_new_tokens: Optional[int] = None,
         num_runs: int = 1,
+        *,
+        temperature: float = 0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        chat_template_name: Optional[str] = None,
+        reasoning_parser: Optional[str] = None,
     ):
         """
         Run the benchmark evaluation.
@@ -152,7 +162,10 @@ class Benchmarker(ABC):
             host = f"http://{host}"
         # Initialize backend
         sglang_args = Namespace(host=host, port=port, backend="srt-no-parallel")
-        set_default_backend(select_sglang_backend(sglang_args))
+        backend = select_sglang_backend(sglang_args)
+        if chat_template_name is not None:
+            backend.chat_template = get_chat_template(chat_template_name)
+        set_default_backend(backend)
 
         # Load data
         questions, labels = self.load_data()
@@ -165,19 +178,30 @@ class Benchmarker(ABC):
                 for question in questions
             ]
 
+        if reasoning_parser is not None:
+            reasoning_parser = ReasoningParser(
+                model_type=reasoning_parser,
+            )
+
         # Create SGL function
         sgl_function = self.create_sgl_function()
 
         # Run evaluation loops
         metrics_list = []
+        histories_list = []
         answer_keys = self.get_answer_keys()
         max_new_tokens = max_new_tokens or self.get_max_new_tokens()
 
         for _ in range(num_runs):
+            histories = []
             tic = time.perf_counter()
             states = sgl_function.run_batch(
                 questions,
-                temperature=0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
                 max_new_tokens=max_new_tokens,
                 num_threads=batch_size,
                 progress_bar=True,
@@ -190,6 +214,13 @@ class Benchmarker(ABC):
             for i in range(len(states)):
                 # Access answer from state object (states[i] supports dict-like access)
                 output = states[i][primary_answer_key]
+                messages = states[i].messages()
+                messages[-1]["reasoning_content"] = ""
+                if reasoning_parser is not None:
+                    reasoning_output, output = reasoning_parser.parse_non_stream(output)
+                    messages[-1]["reasoning_content"] = reasoning_output
+                    messages[-1]["content"] = output
+
                 if isinstance(output, str):
                     extracted = self.extract_answer(
                         output,
@@ -198,6 +229,15 @@ class Benchmarker(ABC):
                 else:
                     extracted = output
                 predictions.append(extracted)
+                histories.append(
+                    {
+                        "text": states[i].text(),
+                        "messages": messages,
+                        "prediction": extracted,
+                        "label": (labels[i] if labels and i < len(labels) else None),
+                    }
+                )
+            histories_list.append(histories)
 
             # Compute accuracy if applicable
             accuracy = None
@@ -236,4 +276,4 @@ class Benchmarker(ABC):
                     )
 
             metrics_list.append(metrics)
-        return metrics_list
+        return histories_list, metrics_list

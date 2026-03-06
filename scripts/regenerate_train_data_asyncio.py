@@ -1,6 +1,6 @@
-﻿"""
+"""
 This script will re-generate the dataset from target model,
-which better aligns the draft model with the target model’s output distribution.
+which better aligns the draft model with the target model's output distribution.
 
 Usage:
 1. Set up one or more SGLang servers for the target model.
@@ -28,14 +28,13 @@ python scripts/regenerate_train_data.py \
 """
 
 import argparse
+import asyncio
 import json
 import os
 import random
-import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 
 
@@ -196,14 +195,14 @@ def build_query_kwargs(args, messages, max_tokens=None):
     return query_kwargs
 
 
-def call_sglang(
+async def call_sglang(
     args,
     server_address: str,
     data: List[Dict[str, Any]],
     max_tokens=None,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
-    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
+    client = AsyncOpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]
     regenerated_messages = []
@@ -225,18 +224,26 @@ def call_sglang(
             query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
 
             try:
-                resp = client.chat.completions.create(**query_kwargs)
+                resp = await client.chat.completions.create(**query_kwargs)
             except Exception as e:
                 data["status"] = "error"
                 data["error"] = str(e)
                 return data
-            response_text = resp.choices[0].message.content
+
+            if not getattr(resp, "choices", None):
+                data["status"] = "error"
+                data["error"] = "No completion choices returned"
+                return data
+
+            choice = resp.choices[0]
+            response_text = choice.message.content
             resp_msg = {
                 "role": "assistant",
                 "content": response_text,
+                "finish_reason": getattr(choice, "finish_reason", None),
             }
             if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+                resp_msg["thinking"] = choice.message.reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -247,7 +254,7 @@ def call_sglang(
     return data
 
 
-def main():
+async def main():
     # Parse command line arguments
     args = parse_arguments()
 
@@ -298,7 +305,7 @@ def main():
         dummy_data = dict(
             conversations=[{"role": "user", "content": "Hello, how are you?"}]
         )
-        result = call_sglang(
+        result = await call_sglang(
             args,
             server_address,
             dummy_data,
@@ -325,31 +332,62 @@ def main():
         f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
     )
     print("-" * 50)
+
     context_token_sum = 0
     context_token_min = None
     context_token_max = 0
     success_samples = 0
     error_samples = 0
 
-    # Create progress bar
-    with (
-        open(args.input_file_path, "r") as input_file,
-        open(args.output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
-    ):
-        executor = ThreadPoolExecutor(
-            max_workers=args.concurrency * len(valid_server_addresses)
-        )
-        waiting_queue = {
-            server_address: [] for server_address in valid_server_addresses
-        }
-        pbar = tqdm(total=total_lines, desc="Processing", initial=len(processed_ids))
-        start_server_index = 0
+    semaphore = asyncio.Semaphore(args.concurrency * len(valid_server_addresses))
 
+    # Use a lock to protect file writes and shared counters
+    write_lock = asyncio.Lock()
+
+    output_file_handle = open(args.output_file_path, file_mode)
+    error_file_handle = open(error_file_path, file_mode)
+
+    pbar = tqdm(total=total_lines, desc="Processing", initial=len(processed_ids))
+
+    async def process_item(data, server_address):
+        nonlocal context_token_sum, context_token_min, context_token_max
+        nonlocal success_samples, error_samples
+
+        async with semaphore:
+            regen_data = await call_sglang(args, server_address, data)
+
+        async with write_lock:
+            if regen_data["status"] == "error":
+                error_file_handle.write(
+                    json.dumps(regen_data, ensure_ascii=False) + "\n"
+                )
+                error_samples += 1
+            else:
+                ctx_len = compute_context_length(
+                    regen_data.get("conversations", [])
+                )
+                context_token_sum += ctx_len
+                if context_token_min is None:
+                    context_token_min = ctx_len
+                else:
+                    context_token_min = min(context_token_min, ctx_len)
+                context_token_max = max(context_token_max, ctx_len)
+
+                output_file_handle.write(
+                    json.dumps(regen_data, ensure_ascii=False) + "\n"
+                )
+                success_samples += 1
+            pbar.update(1)
+
+    # Create all tasks
+    tasks = []
+    start_server_index = 0
+
+    with open(args.input_file_path, "r") as input_file:
         for line in input_file:
             if (
                 args.num_samples is not None
-                and success_samples + error_samples >= args.num_samples
+                and len(tasks) >= args.num_samples
             ):
                 break
 
@@ -358,78 +396,19 @@ def main():
             if args.resume and data.get("id") in processed_ids:
                 continue
 
-            # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
-            start_server_index = (start_server_index + 1) % len(valid_server_addresses)
-
-            # submit prompt to sglang
-            while len(waiting_queue[server_address]) >= args.concurrency:
-                finished_on_request = False
-                # check if any future is done, if so, write the result to the output file
-                for req_future in waiting_queue[server_address]:
-                    if req_future.done():
-                        regen_data = req_future.result()
-
-                        if regen_data["status"] == "error":
-                            error_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            error_samples += 1
-                        else:
-                            ctx_len = compute_context_length(
-                                regen_data.get("conversations", [])
-                            )
-                            context_token_sum += ctx_len
-                            if context_token_min is None:
-                                context_token_min = ctx_len
-                            else:
-                                context_token_min = min(context_token_min, ctx_len)
-                            context_token_max = max(context_token_max, ctx_len)
-
-                            output_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            success_samples += 1
-                        waiting_queue[server_address].remove(req_future)
-                        finished_on_request = True
-
-                if finished_on_request:
-                    break
-                time.sleep(0.01)
-
-            req_future = executor.submit(
-                call_sglang,
-                args,
-                server_address,
-                data,
+            start_server_index = (start_server_index + 1) % len(
+                valid_server_addresses
             )
-            waiting_queue[server_address].append(req_future)
-            pbar.update(1)
 
-        # deal with all the remaining requests
-        for server_address, waiting_queue_items in waiting_queue.items():
-            for req_future in waiting_queue_items:
-                regen_data = req_future.result()
-                if regen_data["status"] == "error":
-                    error_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    error_samples += 1
-                else:
-                    ctx_len = compute_context_length(
-                        regen_data.get("conversations", [])
-                    )
-                    context_token_sum += ctx_len
-                    if context_token_min is None:
-                        context_token_min = ctx_len
-                    else:
-                        context_token_min = min(context_token_min, ctx_len)
-                    context_token_max = max(context_token_max, ctx_len)
+            tasks.append(process_item(data, server_address))
 
-                    output_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    success_samples += 1
+    # Run all tasks concurrently (semaphore limits actual concurrency)
+    await asyncio.gather(*tasks)
+
+    output_file_handle.close()
+    error_file_handle.close()
+    pbar.close()
 
     print(f"\nProcessing completed!")
     if success_samples > 0:
@@ -458,4 +437,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

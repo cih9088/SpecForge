@@ -117,6 +117,34 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# NOTE: K-EXAONE is a hybrid model (like Qwen3) — supports both thinking and
+# non-thinking modes. The official chat_template.jinja has no default system prompt,
+# but system_prompt=None causes GeneralParser/ThinkingParser to crash on ShareGPT
+# entries that start with "assistant" (truncated to zero turns → empty messages list).
+# We inject a default system prompt to avoid this. Could also be fixed in parse.py.
+
+TEMPLATE_REGISTRY.register(
+    name="k-exaone",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n",
+        user_header="<|user|>\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|endofturn|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="k-exaone-thinking",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n<think>\n",
+        user_header="<|user|>\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|endofturn|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="qwen2-vl",
     template=ChatTemplate(

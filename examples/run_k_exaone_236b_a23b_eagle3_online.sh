@@ -9,7 +9,6 @@ if [ -f "$ROOT_DIR/.env" ]; then
   set +a
 fi
 
-export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 # NOTE(@laoconeth): For K-EXAONE, this environment variable seems critical for memory management.
 # Reference: https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
 export PYTORCH_ALLOC_CONF=expandable_segments:True
@@ -21,6 +20,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/k-exaone}"
 
 NUM_GPUS=${1:-8}
 TP_SIZE=${2:-8}
+shift; shift
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-16}
 
 # wandb logging (DO NOT commit API key to git)
@@ -38,8 +38,11 @@ else
     REPORT_TO="--report-to tensorboard"
 fi
 
+if [ -z "${PET_RDZV_ENDPOINT+x}" ]; then
+    export PET_STANDALONE=1
+fi
+
 torchrun \
-    --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path $TARGET_MODEL_PATH \
@@ -62,4 +65,5 @@ torchrun \
     --sglang-mem-fraction-static 0.8 \
     --cache-dir $ROOT_DIR/cache \
     --dist-timeout 60 \
-    $REPORT_TO
+    $REPORT_TO \
+    "$@"

@@ -160,7 +160,7 @@ class OnlineEagle3Model(Eagle3Model):
             length=self.length,
         )
         del target
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  # 769ms GPU bubble per step — CUDA allocator returns all cached memory to OS, forcing re-allocation next step. del target alone lets the caching allocator reuse memory. Commenting out to test if OOM occurs without it.
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape

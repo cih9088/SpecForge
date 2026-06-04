@@ -99,20 +99,6 @@ def initialize_model_parallel(
             [g0, g1], [g2, g3], [g4, g5], [g6, g7]
         2 pipeline model-parallel groups:
             [g0, g2, g4, g6], [g1, g3, g5, g7]
-
-    Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
-    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
-    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
-    function will create the following groups:
-        2 tensor model-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 attention context-parallel groups:
-            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
-        2 moe expert-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 moe data-parallel groups:
-            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
-
     Note that for efficiency, the caller should make sure adjacent ranks
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
@@ -138,12 +124,9 @@ def initialize_model_parallel(
         parallel_state._TP is None
     ), "tensor model parallel group is already initialized"
     group_ranks = []
-    for tp_group_idx in range(num_tensor_model_parallel_groups):
+    for i in range(num_tensor_model_parallel_groups):
         ranks = list(
-            range(
-                tp_group_idx * tensor_model_parallel_size,
-                (tp_group_idx + 1) * tensor_model_parallel_size,
-            )
+            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         )
         group_ranks.append(ranks)
 
@@ -181,6 +164,49 @@ def initialize_model_parallel(
         if parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm is not None:
             parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
+    moe_ep_size = expert_model_parallel_size
+
+    moe_tp_size = tensor_model_parallel_size // moe_ep_size
+    assert (
+        parallel_state._MOE_EP is None
+    ), "expert model parallel group is already initialized"
+    group_ranks = []
+    for i in range(num_tensor_model_parallel_groups):
+        for j in range(moe_tp_size):
+            st = i * tensor_model_parallel_size + j
+            en = (i + 1) * tensor_model_parallel_size + j
+            ranks = list(range(st, en, moe_tp_size))
+            group_ranks.append(ranks)
+
+    parallel_state._MOE_EP = init_model_parallel_group(
+        group_ranks,
+        parallel_state._WORLD.local_rank,
+        backend,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+    assert (
+        parallel_state._MOE_TP is None
+    ), "moe tensor model parallel group is already initialized"
+    if moe_ep_size == 1:
+        parallel_state._MOE_TP = parallel_state._TP
+    else:
+        group_ranks = []
+        for i in range(num_tensor_model_parallel_groups):
+            for j in range(moe_ep_size):
+                st = i * tensor_model_parallel_size + j * moe_tp_size
+                en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
+                ranks = list(range(st, en))
+                group_ranks.append(ranks)
+        parallel_state._MOE_TP = init_model_parallel_group(
+            group_ranks,
+            parallel_state._WORLD.local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="moe_tp",
+        )
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (
         dist.get_world_size() // pipeline_model_parallel_size
@@ -189,9 +215,9 @@ def initialize_model_parallel(
         parallel_state._PP is None
     ), "pipeline model parallel group is already initialized"
     group_ranks = []
-    for pp_group_idx in range(num_pipeline_model_parallel_groups):
+    for i in range(num_pipeline_model_parallel_groups):
         ranks = list(
-            range(pp_group_idx, dist.get_world_size(), num_pipeline_model_parallel_groups)
+            range(i, dist.get_world_size(), num_pipeline_model_parallel_groups)
         )
         group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
@@ -276,24 +302,25 @@ def initialize_model_parallel(
             group_name="attention_tp",
         )
 
-    moe_ep_size = expert_model_parallel_size
-    moe_dp_size = moe_data_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
-
     # Initialize _MOE_DP (moe data parallel group)
-    assert parallel_state._MOE_DP is None, "moe data parallel group is already initialized"
-    # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
+    if not hasattr(parallel_state, "_MOE_DP"):
+        parallel_state._MOE_DP = None
+    assert (
+        parallel_state._MOE_DP is None
+    ), "moe data parallel group is already initialized"
+    moe_dp_size = moe_data_model_parallel_size
+    moe_tp_size_for_dp = tensor_model_parallel_size // moe_ep_size // moe_dp_size
     if moe_dp_size == tensor_model_parallel_size:
         parallel_state._MOE_DP = parallel_state._TP
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for tp_ep_combined_idx in range(moe_tp_size * moe_ep_size):
+            for tp_ep_combined_idx in range(moe_tp_size_for_dp * moe_ep_size):
                 st = tp_group_idx * tensor_model_parallel_size + tp_ep_combined_idx
                 en = (
                     tp_group_idx + 1
                 ) * tensor_model_parallel_size + tp_ep_combined_idx
-                ranks = list(range(st, en, moe_tp_size * moe_ep_size))
+                ranks = list(range(st, en, moe_tp_size_for_dp * moe_ep_size))
                 group_ranks.append(ranks)
         parallel_state._MOE_DP = init_model_parallel_group(
             group_ranks,
@@ -301,59 +328,6 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
         )
-
-    # Initialize _MOE_EP (moe expert group)
-    assert parallel_state._MOE_EP is None, "expert model parallel group is already initialized"
-    if moe_ep_size == tensor_model_parallel_size:
-        parallel_state._MOE_EP = parallel_state._TP
-    else:
-        # TODO(ch-wan): use split_group to save memory
-        group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for moe_dp_idx in range(moe_dp_size):
-                for moe_tp_idx in range(moe_tp_size):
-                    st = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + moe_dp_idx * moe_ep_size * moe_tp_size
-                        + moe_tp_idx
-                    )
-                    en = st + moe_ep_size * moe_tp_size
-                    ranks = list(range(st, en, moe_tp_size))
-                    group_ranks.append(ranks)
-        parallel_state._MOE_EP = init_model_parallel_group(
-            group_ranks,
-            parallel_state._WORLD.local_rank,
-            backend,
-            group_name="moe_ep",
-        )
-
-    # Initialize _MOE_TP (moe tensor group)
-    assert parallel_state._MOE_TP is None, "expert model tensor parallel group is already initialized"
-    if moe_tp_size == tensor_model_parallel_size:
-        parallel_state._MOE_TP = parallel_state._TP
-    else:
-        # TODO(ch-wan): use split_group to save memory
-        group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
-                st = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + ep_dp_combined_idx * moe_tp_size
-                )
-                en = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + (ep_dp_combined_idx + 1) * moe_tp_size
-                )
-                ranks = list(range(st, en))
-                group_ranks.append(ranks)
-        parallel_state._MOE_TP = init_model_parallel_group(
-            group_ranks,
-            parallel_state._WORLD.local_rank,
-            backend,
-            use_custom_allreduce=False,
-            group_name="moe_tp",
-        )
-
 
 
 def initialize_dp_attention(

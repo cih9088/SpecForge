@@ -930,3 +930,4 @@ def _get_sharded_return(
     input_scatter = torch.split(input_, valid_input_lens, dim=0)
     for j, idx in enumerate(valid_indices):
         out[idx] = input_scatter[j]
+    return out

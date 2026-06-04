@@ -142,7 +142,6 @@ class SGLangRunner(ModelRunner):
 
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
-                attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_data_parallel_size=dp_size,

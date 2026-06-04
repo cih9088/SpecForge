@@ -154,21 +154,9 @@ def replaced_logits_processor_forward_for_eagle3(
     )
     del hidden_states
 
-    hidden_states_to_store = self._get_hidden_states_to_store(
-        hidden_states,
-        hidden_states_before_norm,
-        aux_hidden_states,
-        pruned_states,
-        pruned_states_before_norm,
-        aux_pruned_states,
-        sample_indices,
-        logits_metadata,
-    )
-    del hidden_states
-
-    assert not logits_metadata.extend_return_logprob, (
-        "extend_return_logprob is not supported"
-    )
+    assert (
+        not logits_metadata.extend_return_logprob
+    ), "extend_return_logprob is not supported"
     # Decode mode or extend mode without return_logprob.
     return ReplacedLogitsProcessorEagle3Output(
         logits=logits,

@@ -73,6 +73,8 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    # NOTE: torch_compile parameter was removed in sglang 0.5.9
+    # torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -80,16 +82,14 @@ def initialize_model_parallel(
     Arguments:
         tensor_model_parallel_size: number of GPUs used for tensor model
             parallelism.
-        expert_model_parallel_size: number of GPUs used for expert model
-            parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
         attention_data_parallel_size: number of GPUs used for attention data
-            parallelism.
+            parallelism. (Added in sglang 0.5.9)
         attention_context_model_parallel_size: number of GPUs used for attention context
-            parallelism.
+            parallelism. (Added in sglang 0.5.9)
         moe_data_model_parallel_size: number of GPUs used for moe data
-            parallelism.
+            parallelism. (Added in sglang 0.5.9)
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -148,6 +148,7 @@ def initialize_model_parallel(
         group_ranks.append(ranks)
 
     # message queue broadcaster is only used in tensor model parallel group
+    # NOTE: torch_compile parameter was removed in sglang 0.5.9
     parallel_state._TP = init_model_parallel_group(
         group_ranks,
         parallel_state._WORLD.local_rank,
@@ -163,9 +164,7 @@ def initialize_model_parallel(
         assert (
             parallel_state._PDMUX_PREFILL_TP_GROUP is None
         ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        assert (
-            parallel_state._PDMUX_PREFILL_TP_GROUP is None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        # NOTE: torch_compile parameter was removed in sglang 0.5.9
         parallel_state._PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
@@ -176,8 +175,11 @@ def initialize_model_parallel(
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
         )
-        parallel_state._TP.pynccl_comm.disabled = False
-        parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+        # NOTE: Check pynccl_comm exists before accessing it (may be None in sglang 0.5.9)
+        if parallel_state._TP.pynccl_comm is not None:
+            parallel_state._TP.pynccl_comm.disabled = False
+        if parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm is not None:
+            parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
@@ -341,33 +343,140 @@ def initialize_model_parallel(
         group_name="pp",
     )
 
+    # NOTE: Added for sglang 0.5.9 - Initialize attention parallel groups
+    # These are required by get_attention_tp_group() and get_attention_cp_group()
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+    attn_dp_size = attention_data_parallel_size
+    attn_cp_size = attention_context_model_parallel_size
+    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+
+    # Initialize _ATTN_CP (attention context parallel group)
+    if not hasattr(parallel_state, "_ATTN_CP"):
+        parallel_state._ATTN_CP = None
+    assert (
+        parallel_state._ATTN_CP is None
+    ), "attention context model parallel group is already initialized"
+    if attn_cp_size == tensor_model_parallel_size:
+        parallel_state._ATTN_CP = parallel_state._TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for dp_idx in range(attn_dp_size):
+                for attn_tp_idx in range(attn_tp_size):
+                    st = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + dp_idx * attn_tp_size * attn_cp_size
+                        + attn_tp_idx
+                    )
+                    en = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + (dp_idx + 1) * attn_tp_size * attn_cp_size
+                        + attn_tp_idx
+                    )
+                    ranks = list(range(st, en, attn_tp_size))
+                    group_ranks.append(ranks)
+        parallel_state._ATTN_CP = init_model_parallel_group(
+            group_ranks,
+            parallel_state._WORLD.local_rank,
+            backend,
+            group_name="attn_cp",
+        )
+
+    # Initialize _ATTN_TP (attention tensor parallel group)
+    if not hasattr(parallel_state, "_ATTN_TP"):
+        parallel_state._ATTN_TP = None
+    assert (
+        parallel_state._ATTN_TP is None
+    ), "attention tensor model parallel group is already initialized"
+    if attn_tp_size == tensor_model_parallel_size:
+        parallel_state._ATTN_TP = parallel_state._TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
+                st = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + cp_dp_combined_idx * attn_tp_size
+                )
+                en = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + (cp_dp_combined_idx + 1) * attn_tp_size
+                )
+                ranks = list(range(st, en))
+                group_ranks.append(ranks)
+        parallel_state._ATTN_TP = init_model_parallel_group(
+            group_ranks,
+            parallel_state._WORLD.local_rank,
+            backend,
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="attention_tp",
+        )
+
+    # Initialize _MOE_DP (moe data parallel group)
+    if not hasattr(parallel_state, "_MOE_DP"):
+        parallel_state._MOE_DP = None
+    assert (
+        parallel_state._MOE_DP is None
+    ), "moe data parallel group is already initialized"
+    moe_dp_size = moe_data_model_parallel_size
+    moe_tp_size_for_dp = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+    if moe_dp_size == tensor_model_parallel_size:
+        parallel_state._MOE_DP = parallel_state._TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for tp_ep_combined_idx in range(moe_tp_size_for_dp * moe_ep_size):
+                st = tp_group_idx * tensor_model_parallel_size + tp_ep_combined_idx
+                en = (
+                    tp_group_idx + 1
+                ) * tensor_model_parallel_size + tp_ep_combined_idx
+                ranks = list(range(st, en, moe_tp_size_for_dp * moe_ep_size))
+                group_ranks.append(ranks)
+        parallel_state._MOE_DP = init_model_parallel_group(
+            group_ranks,
+            parallel_state._WORLD.local_rank,
+            backend,
+            group_name="moe_dp",
+        )
+
 
 def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
+    """
+    Initialize data parallel attention.
+
+    Updated for sglang 0.5.9:
+    - Added attn_cp_size parameter support
+    - Removed _ATTN_TP_GROUP creation (now handled by initialize_model_parallel in sglang 0.5.9)
+    """
     import sglang.srt.layers.dp_attention as dp_attention
 
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
-    attn_cp_size = server_args.attn_cp_size
+    pp_size = server_args.pp_size
+    # NOTE: attn_cp_size is new in sglang 0.5.9
+    attn_cp_size = getattr(server_args, "attn_cp_size", 1)
 
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
+    dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+
+    # NOTE: Added attn_cp_size parameter for sglang 0.5.9
     (
         _,
         _,
         dp_attention._ATTN_DP_RANK,
     ) = compute_dp_attention_world_info(
-        enable_dp_attention,
-        tp_rank,
-        tp_size,
-        dp_size,
-        attn_cp_size,
+        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, dp_attention._LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
@@ -384,6 +493,10 @@ def initialize_dp_attention(
     else:
         dp_attention._ATTN_DP_SIZE = 1
         dp_attention._LOCAL_ATTN_DP_SIZE = 1
+
+    # NOTE: In sglang 0.5.9, _ATTN_TP_GROUP is created in initialize_model_parallel.
+    # We no longer need to manually create it here to avoid conflicts.
+    # The assertion error occurs because we were trying to recreate an already-initialized group.
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

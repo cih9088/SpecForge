@@ -12,6 +12,8 @@ class TrackerArgs:
     wandb_name: str = None
     wandb_key: str = None
     wandb_entity: str = None
+    wandb_offline: bool = False
+    wandb_dir: str = None
     swanlab_project: str = None
     swanlab_name: str = None
     swanlab_key: str = None
@@ -35,6 +37,17 @@ class TrackerArgs:
         parser.add_argument("--wandb-name", type=str, default=None)
         parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
         parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team or username).")
+        parser.add_argument(
+            "--wandb-offline",
+            action="store_true",
+            help="Enable W&B offline mode and store logs locally.",
+        )
+        parser.add_argument(
+            "--wandb-dir",
+            type=str,
+            default=None,
+            help="Directory to store W&B files. Defaults to './wandb' under the project root when using W&B.",
+        )
         # swanlab-specific args
         parser.add_argument(
             "--swanlab-project",

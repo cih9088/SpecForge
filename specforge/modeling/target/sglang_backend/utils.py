@@ -49,6 +49,9 @@ def replaced_logits_processor_forward_for_eagle3(
     """
     This is a modified forward function for the SGLang's logits processor, adapted from https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/layers/logits_processor.py.
     The modification is to return the logits and aux hidden states instead of the last hidden states.
+
+    Updated for sglang 0.5.9:
+    - Added hidden_states_before_norm parameter for compatibility
     """
     if isinstance(logits_metadata, ForwardBatch):
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
@@ -96,7 +99,6 @@ def replaced_logits_processor_forward_for_eagle3(
     chunk_sizes: list[int] = []
     if shard_returns:
         tp_group = get_tp_group()
-        # TODO(@cih9088): is extend_seq_lens valid always?
         seq_lens = logits_metadata.extend_seq_lens.tolist()
         if len(seq_lens) != tp_group.world_size:
             assert len(seq_lens) % tp_group.world_size == 0
@@ -139,6 +141,18 @@ def replaced_logits_processor_forward_for_eagle3(
         hidden_states = torch.split(hidden_states, chunk_sizes, dim=0)[
             cast(GroupCoordinator, tp_group).rank_in_group
         ]
+
+    hidden_states_to_store = self._get_hidden_states_to_store(
+        hidden_states,
+        hidden_states_before_norm,
+        aux_hidden_states,
+        pruned_states,
+        pruned_states_before_norm,
+        aux_pruned_states,
+        sample_indices,
+        logits_metadata,
+    )
+    del hidden_states
 
     hidden_states_to_store = self._get_hidden_states_to_store(
         hidden_states,
@@ -201,13 +215,7 @@ def replaced_logits_processor_get_logits(
 
     logits = self._scatter_dp_attn_logits(logits, local_hidden_states, logits_metadata)
 
-    # Skip _copy_logits_to_buffer: it upcasts bf16→fp32 for the full vocab tensor,
-    # causing a ~418ms GPU bubble from cudaMalloc/cudaFree. EAGLE3 training doesn't
-    # need fp32 logits here — the loss computation upcasts later after vocab mapping
-    # reduces the tensor to 1/5 size (see specforge/core/eagle3.py:596).
-    # Verified: bf16 vs fp32 output is exact equal (0 diff across 1.47B values).
-    logits = logits[:, : self.vocab_size]
-    # logits = self._copy_logits_to_buffer(logits, logits_metadata)
+    logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
     if self.final_logit_softcapping:
         if not is_npu():
@@ -246,7 +254,10 @@ class LogitsProcessorForEAGLE3(torch.nn.Module):
             raise NotImplementedError(
                 "'shard_returns' does not support attention tensor parallel"
             )
-        if not self.logits_processor.do_tensor_parallel_all_gather and self._shard_returns:
+        if (
+            not self.logits_processor.do_tensor_parallel_all_gather
+            and self._shard_returns
+        ):
             raise ValueError(
                 "'shard_returns' does nothing if do_tensor_parallel_all_gather is False"
             )
@@ -304,7 +315,7 @@ def tensor_all_to_all(
 
     assert group.world_size == len(chunk_sizes), "chunk size must equal to world size"
 
-    scatter_list = list(input_.split(chunk_sizes))
+    scatter_list = list(input_.split(chunk_sizes, dim=scatter_dim))
     gather_list = [
         torch.zeros_like(scatter_list[group.rank_in_group]) for _ in scatter_list
     ]

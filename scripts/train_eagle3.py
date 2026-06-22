@@ -83,10 +83,8 @@ def print_cuda_memory_debug(label: str) -> None:
     )
 
 
-def parse_args() -> Tuple[ArgumentParser, Namespace]:
-    """
-    This function is used to parse the arguments for the training script.
-    """
+def build_parser() -> ArgumentParser:
+    """Build the training argument parser (import-safe seam for tests)."""
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
     # add model-related arguments
@@ -199,6 +197,28 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
+    # LK / acceptance-rate loss arguments
+    lk_group = parser.add_argument_group("lk loss")
+    lk_group.add_argument(
+        "--lk-loss-type",
+        type=str,
+        default=None,
+        choices=["lambda", "alpha"],
+        help="Enable LK loss objective. Choices: lambda (hybrid KL+LK), alpha (pure acceptance-rate likelihood).",
+    )
+    lk_group.add_argument(
+        "--kl-scale",
+        type=float,
+        default=1.0,
+        help="Scale for adaptive KL weight: kl_weight = kl_scale * exp(-kl_decay * acc). Used when --lk-loss-type=lambda.",
+    )
+    lk_group.add_argument(
+        "--kl-decay",
+        type=float,
+        default=3.0,
+        help="Decay for adaptive KL weight. Used when --lk-loss-type=lambda.",
+    )
+
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -210,6 +230,25 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # distributed training
     optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
     optimization_group.add_argument("--sp-ring-size", type=int, default=1)
+    optimization_group.add_argument(
+        "--compact-teacher",
+        action="store_true",
+        help=(
+            "Offline only: compute the EAGLE-3 teacher distribution from target "
+            "hidden states via a draft-vocab-sliced head plus a streaming "
+            "logsumexp/argmax, avoiding the full-vocab [B, S, vocab] fp32 logits. "
+            "Default off; training behavior is unchanged when off."
+        ),
+    )
+    optimization_group.add_argument(
+        "--compact-teacher-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Vocabulary chunk size for the compact-teacher streaming reduction. "
+            "Defaults to compact_teacher.DEFAULT_VOCAB_CHUNK_SIZE when unset."
+        ),
+    )
     optimization_group.add_argument(
         "--attention-backend",
         type=str,
@@ -260,8 +299,40 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
+    return parser
+
+
+def parse_args() -> Tuple[ArgumentParser, Namespace]:
+    """Parse CLI arguments for the training script."""
+    parser = build_parser()
     args = parser.parse_args()
     return parser, args
+
+
+def validate_compact_teacher_args(
+    args: Namespace,
+    is_online: bool,
+    target_model,
+    draft_model,
+    draft_model_config,
+) -> None:
+    """Validate compact-teacher settings before training (offline exact mode)."""
+    from specforge.core.compact_teacher import (
+        validate_compact_teacher_enabled,
+        validate_vocab_mapping_consistency,
+    )
+
+    target_head_weight = getattr(getattr(target_model, "fc", None), "weight", None)
+    validate_compact_teacher_enabled(
+        is_online=is_online,
+        is_vlm=args.is_vlm,
+        draft_vocab_size=draft_model_config.draft_vocab_size,
+        vocab_size=draft_model_config.vocab_size,
+        t2d=draft_model.t2d,
+        target_head_weight=target_head_weight,
+        chunk_size=args.compact_teacher_chunk_size,
+    )
+    validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
 
 def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
@@ -372,6 +443,10 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.kl_scale < 0:
+        raise ValueError(f"--kl-scale must be non-negative, got {args.kl_scale}")
+    if args.kl_decay < 0:
+        raise ValueError(f"--kl-decay must be non-negative, got {args.kl_decay}")
     if args.attention_backend == "usp":
         sp_sanity_check(args)
     if args.shard_target_output:
@@ -587,6 +662,21 @@ def build_dataloaders(
     )
 
 
+def filter_draft_state_dict(model_state_dict: dict) -> dict:
+    """Keep only draft-model weights for the serving checkpoint (drop embeddings).
+
+    Embeddings are intentionally excluded (SGLang loads them from the target); the
+    target ``TargetHead`` is never part of the wrapped draft model, so no teacher state
+    can leak. The compact-teacher flag adds no new draft-model state, so its export is
+    identical to the full path.
+    """
+    return {
+        k.replace("draft_model.", ""): v
+        for k, v in model_state_dict.items()
+        if "draft_model." in k and "embed" not in k.lower()
+    }
+
+
 def save_checkpoints(
     args: Namespace,
     epoch: int,
@@ -607,11 +697,7 @@ def save_checkpoints(
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
+        draft_model_state_dict = filter_draft_state_dict(model_state_dict)
 
         if dist.get_rank() == 0:
             torch.save(
@@ -642,11 +728,12 @@ def run_forward(
     List[torch.Tensor],
     List[torch.Tensor],
     List[torch.Tensor],
+    List[torch.Tensor],
 ]:
     if args.is_vlm and args.target_model_backend == "custom":
         (
             plosses,
-            _,
+            acceptance_rates,
             acces,
             acc_corrects,
             acc_denoms,
@@ -661,6 +748,7 @@ def run_forward(
         )
     else:
         image_grid_thw = None
+        compact_kwargs = {}
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
             # Handle VLM data: pixel_values and image_grid_thw are lists
@@ -711,13 +799,19 @@ def run_forward(
                 data["input_ids"], data["target"], data["loss_mask"]
             )
             input_ids = input_ids.cuda()
-            target = target_model(
-                target.cuda()
-            )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
+            from specforge.core.compact_teacher import build_offline_teacher_inputs
+
+            target, offline_compact_kwargs = build_offline_teacher_inputs(
+                compact=args.compact_teacher,
+                target_model=target_model,
+                target_hidden=target.cuda(),
+                chunk_size_arg=args.compact_teacher_chunk_size,
+            )
+            compact_kwargs.update(offline_compact_kwargs)
         (
             plosses,
-            _,
+            acceptance_rates,
             acces,
             acc_corrects,
             acc_denoms,
@@ -734,8 +828,17 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            **compact_kwargs,
         )
-    return plosses, acces, acc_corrects, acc_denoms, metric_losses, metric_loss_denoms
+    return (
+        plosses,
+        acces,
+        acceptance_rates,
+        acc_corrects,
+        acc_denoms,
+        metric_losses,
+        metric_loss_denoms,
+    )
 
 
 def run_backward_and_update(
@@ -764,6 +867,7 @@ def run_backward_and_update(
 def record_metrcs(
     args: Namespace,
     accuracies: List[torch.Tensor],
+    acceptance_rates: List[torch.Tensor],
     plosses: List[torch.Tensor],
     global_step: int,
     tracker: Tracker,
@@ -798,6 +902,16 @@ def record_metrcs(
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+        )
+
+    acceptance_rates = torch.stack(acceptance_rates)
+    assert acceptance_rates.shape[0] == args.ttt_length
+    dist.all_reduce(acceptance_rates, op=dist.ReduceOp.AVG)
+    acceptance_rates = acceptance_rates.cpu().tolist()
+    for i in range(len(acceptance_rates)):
+        logdict[f"{mode}/acceptance_rate_{i}"] = acceptance_rates[i]
+        print_on_rank0(
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acceptance Rate: {acceptance_rates[i]:.4f}"
         )
 
     if ploss_denoms is not None:
@@ -914,6 +1028,12 @@ def main():
     print_with_rank("Loaded vocab mapping")
     print_cuda_memory_debug("after load_vocab_mapping")
 
+    if args.compact_teacher:
+        validate_compact_teacher_args(
+            args, is_online, target_model, draft_model, draft_model_config
+        )
+        print_with_rank("Validated compact-teacher configuration (offline exact mode)")
+
     # Calculate total steps if not provided
     if args.total_steps is None:
         steps_per_epoch = math.ceil(
@@ -941,6 +1061,9 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            lk_loss_type=args.lk_loss_type,
+            kl_scale=args.kl_scale,
+            kl_decay=args.kl_decay,
         )
     else:
         if is_online:
@@ -949,6 +1072,9 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                lk_loss_type=args.lk_loss_type,
+                kl_scale=args.kl_scale,
+                kl_decay=args.kl_decay,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -956,6 +1082,9 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                lk_loss_type=args.lk_loss_type,
+                kl_scale=args.kl_scale,
+                kl_decay=args.kl_decay,
             )
     eagle3_model = FSDP(
         eagle3_model,
@@ -1077,6 +1206,7 @@ def main():
             (
                 plosses,
                 acces,
+                acceptance_rates,
                 acc_corrects,
                 acc_denoms,
                 metric_losses,
@@ -1119,6 +1249,7 @@ def main():
                 record_metrcs(
                     args,
                     acces,
+                    acceptance_rates,
                     metric_loss_weighted_sums,
                     global_step // args.draft_accumulation_steps,
                     tracker,
@@ -1146,9 +1277,13 @@ def main():
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
                 last_time = time.time()
+                avg_acceptance_rate = sum(ar for ar in acceptance_rates) / len(
+                    acceptance_rates
+                )
                 postfix = {
                     "loss": f"{avg_loss:.2f}",
                     "acc": f"{avg_acc:.2f}",
+                    "acceptance_rate": f"{avg_acceptance_rate:.2f}",
                     "time": f"{time_per_step:.2f}s",
                 }
                 if last_grad_norm is not None:
@@ -1170,15 +1305,28 @@ def main():
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
+                eval_acceptance_rates = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, acces, _, _, _, _ = run_forward(
+                        (
+                            plosses,
+                            acces,
+                            acceptance_rates,
+                            _,
+                            _,
+                            _,
+                            _,
+                        ) = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
                             eval_acces[i] + [acces[i]] for i in range(len(acces))
+                        ]
+                        eval_acceptance_rates = [
+                            eval_acceptance_rates[i] + [acceptance_rates[i]]
+                            for i in range(len(acceptance_rates))
                         ]
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
@@ -1186,20 +1334,25 @@ def main():
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
+                eval_acceptance_rates = [
+                    torch.stack(ar).mean() for ar in eval_acceptance_rates
+                ]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
                 record_metrcs(
                     args,
                     eval_acces,
+                    eval_acceptance_rates,
                     eval_plosses,
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )
+                draft_model.train()
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
-            if global_step % args.save_interval == 0:
+            if global_step % (args.save_interval * args.draft_accumulation_steps) == 0:
                 # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 

@@ -59,7 +59,7 @@ class TemplateRegistry:
             override(bool): Whether to override the existing template, default to False
         """
         assert (
-            not override and name not in self.templates
+            override or name not in self.templates
         ), f"Chat template for the model type {name} has already been registered"
         self.templates[name] = template
 
@@ -144,6 +144,16 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|endofturn|>\n",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="lfm",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="",
+        end_of_turn_token="<|im_end|>\n",
     ),
 )
 

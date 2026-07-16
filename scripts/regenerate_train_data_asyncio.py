@@ -48,19 +48,18 @@ def parse_arguments():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
-        "--is-reasoning-model",
-        action="store_true",
-        help="Whether the model is a reasoning model",
+        "--reasoning",
+        choices=["none", "save", "disable"],
+        default="none",
+        help=(
+            "Reasoning mode: 'none' for standard models, 'save' to store "
+            "reasoning_content, or 'disable' to disable thinking via extra_body"
+        ),
     )
     model_group.add_argument(
         "--is-gpt-oss",
         action="store_true",
         help="Whether the model is a GPT-OSS model",
-    )
-    model_group.add_argument(
-        "--disable-thinking",
-        action="store_true",
-        help="Disable thinking by passing enable_thinking=False via chat_template_kwargs",
     )
 
     # sampling params
@@ -186,8 +185,10 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
-    if args.disable_thinking:
+    if args.reasoning == "disable":
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    elif args.reasoning == "save":
+        extra_body["chat_template_kwargs"] = {"enable_thinking": True}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -242,8 +243,9 @@ async def call_sglang(
                 "content": response_text,
                 "finish_reason": getattr(choice, "finish_reason", None),
             }
-            if args.is_reasoning_model:
-                resp_msg["thinking"] = choice.message.reasoning_content
+            reasoning_content = getattr(choice.message, "reasoning_content", None)
+            if args.reasoning == "save":
+                resp_msg["reasoning_content"] = reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -332,7 +334,6 @@ async def main():
         f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
     )
     print("-" * 50)
-
     context_token_sum = 0
     context_token_min = None
     context_token_max = 0

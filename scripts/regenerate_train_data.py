@@ -211,18 +211,9 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
-    query_messages = messages
-    if args.reasoning == "save":
-        query_messages = []
-        for message in messages:
-            query_message = dict(message)
-            if query_message.get("role") == "assistant":
-                query_message.pop("reasoning_content", None)
-            query_messages.append(query_message)
-
     query_kwargs = dict(
         model=args.model,
-        messages=query_messages,
+        messages=messages,
         max_tokens=effective_max_tokens,
         temperature=args.temperature,
         stream=False,
@@ -364,7 +355,7 @@ def main():
 
     processed_ids = set()
     if args.resume:
-        for path in [args.output_file_path, error_file_path]:
+        for path in [args.output_file_path, error_file_path, skipped_file_path]:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     for line in f:

@@ -37,6 +37,33 @@ from typing import Any, Dict, List
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
+def validate_regen_input(data: Any) -> str | None:
+    """Return why a ShareGPT row cannot be regenerated, or ``None``."""
+    if not isinstance(data, dict):
+        return "Expected a JSON object"
+
+    return validate_conversation(
+        data.get("conversations"),
+        error_style="regeneration",
+    )
+
+try:
+    from scripts.conversation_validation import has_think_marker, validate_conversation
+except ModuleNotFoundError:
+    from conversation_validation import has_think_marker, validate_conversation
+
+def set_skipped(data: Any, error: str) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"status": "skipped", "error": error, "data": data}
+    data["status"] = "skipped"
+    data["error"] = error
+    return data
+
+
+def count_lines(path: str) -> int:
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for _ in handle)
+
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -235,16 +262,49 @@ async def call_sglang(
                 data["status"] = "error"
                 data["error"] = "No completion choices returned"
                 return data
-
             choice = resp.choices[0]
+
             response_text = choice.message.content
+            if args.reasoning == "disable" and (
+                not isinstance(response_text, str)
+                or not response_text.strip()
+                or has_think_marker(response_text)
+            ):
+                return set_skipped(
+                    data,
+                    "Non-reasoning assistant response is empty or contains a thinking marker",
+                )
             resp_msg = {
                 "role": "assistant",
                 "content": response_text,
                 "finish_reason": getattr(choice, "finish_reason", None),
             }
-            reasoning_content = getattr(choice.message, "reasoning_content", None)
             if args.reasoning == "save":
+                reasoning_content = getattr(choice.message, "reasoning_content", None)
+                if reasoning_content is None:
+                    model_extra = getattr(choice.message, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        reasoning_content = model_extra.get("reasoning_content")
+                if max_tokens is None and (
+                    not isinstance(response_text, str)
+                    or not response_text.strip()
+                    or not isinstance(reasoning_content, str)
+                    or not reasoning_content.strip()
+                ):
+                    data["status"] = "error"
+                    data["error"] = (
+                        "Reasoning generation requires non-empty assistant content "
+                        "and reasoning_content"
+                    )
+                    return data
+                if max_tokens is None and (
+                    has_think_marker(response_text)
+                    or has_think_marker(reasoning_content)
+                ):
+                    return set_skipped(
+                        data,
+                        "Reasoning response contains a residual thinking marker",
+                    )
                 resp_msg["reasoning_content"] = reasoning_content
             regenerated_messages.append(resp_msg)
         else:
@@ -277,13 +337,14 @@ async def main():
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
     print("-" * 50)
-    total_lines = sum(1 for _ in open(args.input_file_path))
+    total_lines = count_lines(args.input_file_path)
 
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
 
     processed_ids = set()
     if args.resume:
-        for path in [args.output_file_path, error_file_path]:
+        for path in [args.output_file_path, error_file_path, skipped_file_path]:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     for line in f:
@@ -313,7 +374,7 @@ async def main():
             dummy_data,
             max_tokens=1,
         )
-        if result is not None:
+        if result is not None and result.get("status") == "success":
             valid_server_addresses.append(server_address)
         else:
             print(f"Server {server_address} is not available")
@@ -339,6 +400,7 @@ async def main():
     context_token_max = 0
     success_samples = 0
     error_samples = 0
+    skipped_samples = 0
 
     semaphore = asyncio.Semaphore(args.concurrency * len(valid_server_addresses))
 
@@ -347,6 +409,7 @@ async def main():
 
     output_file_handle = open(args.output_file_path, file_mode)
     error_file_handle = open(error_file_path, file_mode)
+    skipped_file_handle = open(skipped_file_path, file_mode)
 
     pbar = tqdm(total=total_lines, desc="Processing", initial=len(processed_ids))
 
@@ -363,6 +426,11 @@ async def main():
                     json.dumps(regen_data, ensure_ascii=False) + "\n"
                 )
                 error_samples += 1
+            elif regen_data["status"] == "skipped":
+                skipped_file_handle.write(
+                    json.dumps(regen_data, ensure_ascii=False) + "\n"
+                )
+                skipped_samples += 1
             else:
                 ctx_len = compute_context_length(
                     regen_data.get("conversations", [])
@@ -393,6 +461,15 @@ async def main():
                 break
 
             data = json.loads(line.strip())
+            invalid_reason = validate_regen_input(data)
+            if invalid_reason is not None:
+                skipped_file_handle.write(
+                    json.dumps(set_skipped(data, invalid_reason), ensure_ascii=False)
+                    + "\n"
+                )
+                skipped_samples += 1
+                pbar.update(1)
+                continue
 
             if args.resume and data.get("id") in processed_ids:
                 continue
@@ -409,6 +486,8 @@ async def main():
 
     output_file_handle.close()
     error_file_handle.close()
+    skipped_file_handle.close()
+
     pbar.close()
 
     print(f"\nProcessing completed!")
@@ -428,12 +507,15 @@ async def main():
         print(f"\nResume processing completed!")
         print(f"  Previously processed: {previously}")
         print(
-            f"  Newly processed: {total_processed} ({success_samples} success, {error_samples} failed)"
+            f"  Newly processed: {total_processed} "
+            f"({success_samples} success, {error_samples} failed, "
+            f"{skipped_samples} skipped)"
         )
         print(f"  Total: {previously + total_processed}")
     else:
         print(
-            f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
+            f"\nProcessing completed! {success_samples} samples regenerated, "
+            f"{error_samples} samples failed, {skipped_samples} samples skipped."
         )
 
 

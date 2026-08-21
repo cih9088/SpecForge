@@ -266,6 +266,8 @@ class _ConfiguredOptimizerFactory:
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
+            betas=t.betas,
+            weight_decay=t.weight_decay,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             lr_scheduler=t.lr_scheduler,

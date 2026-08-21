@@ -17,6 +17,7 @@ class BF16Optimizer:
         self,
         model,
         lr,
+        betas=(0.9, 0.999),
         weight_decay=0.0,
         max_grad_norm=0.5,
         total_steps=800_000,
@@ -40,7 +41,7 @@ class BF16Optimizer:
         for mp in self.fp32_params:
             mp.requires_grad = True
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
+            self.fp32_params, lr=lr, betas=betas, weight_decay=weight_decay
         )
         self.last_grad_norm = None
         self._grad_norm_process_group = None

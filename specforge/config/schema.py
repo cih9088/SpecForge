@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -531,6 +531,8 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
+    betas: Tuple[float, float] = Field(default_factory=lambda: (0.9, 0.999))
+    weight_decay: float = Field(default=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)

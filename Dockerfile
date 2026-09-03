@@ -26,7 +26,10 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.12
 ARG FLASH_ATTENTION_VERSIONS
-ARG FLASH_ATTENTION_FORCE_BUILD=FALSE
+ARG FLASH_ATTENTION_FORCE_BUILD=TRUE
+ARG FLASH_ATTENTION_2_VERSION=2.8.3.post1
+ARG FLASH_ATTENTION_3_COMMIT=484a5dc1b1058bcbe03b3aeb81334c49cfcf6ba3
+ARG FLASH_ATTENTION_4_VERSION=4.0.0b15
 ARG MOONCAKE_VERSION=0.3.11.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
@@ -390,41 +393,63 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ########################################################
 FROM torch_deps AS fa_cache
 
+ARG CUDA_VERSION
+ARG BUILD_AND_DOWNLOAD_PARALLEL
+ARG GITHUB_ARTIFACTORY
 ARG FLASH_ATTENTION_VERSIONS
 ARG FLASH_ATTENTION_FORCE_BUILD
+ARG FLASH_ATTENTION_2_VERSION
+ARG FLASH_ATTENTION_3_COMMIT
+ARG FLASH_ATTENTION_4_VERSION
 
-# Install FlashAttention
+# Install the selected FlashAttention versions into this stage.
 RUN --mount=type=cache,target=/root/.cache/pip \
-     echo "$FLASH_ATTENTION_VERSIONS" | sed 's/,/\n/g' | while read FLASH_ATTENTION_VERSION; do \
-        if [ -z "$FLASH_ATTENTION_VERSION" ]; then \
-            :; \
-        elif [ "$FLASH_ATTENTION_VERSION" -eq 2 ]; then \
-            pip install flash-attn --no-build-isolation \
-            && cp -r /usr/local/lib/python3.12/dist-packages/flash_attn /flash_attn/ \
-            && cp -r /usr/local/lib/python3.12/dist-packages/flash_attn-2*.dist-info /flash_attn/  \
-            && cp -r /usr/local/lib/python3.12/dist-packages/flash_attn_2_cuda* /flash_attn/; \
-        elif [ "$FLASH_ATTENTION_VERSION" -eq 3 ]; then \
-            git clone https://github.com/Dao-AILab/flash-attention /sgl-workspace/flash-attention \
-            && ( cd /sgl-workspace/flash-attention && git reset 484a5dc1b1058bcbe03b3aeb81334c49cfcf6ba3 --hard ) \
-            && ( cd /sgl-workspace/flash-attention/hopper && python setup.py install ) \
-            && cp /usr/local/lib/python3.12/dist-packages/flash_attn_interface.py /flash_attn/ \
-            && cp /usr/local/lib/python3.12/dist-packages/flash_attn_config.py /flash_attn/ \
-            && cp -r /usr/local/lib/python3.12/dist-packages/flash_attn_3 /flash_attn/ \
-            && cp -r /usr/local/lib/python3.12/dist-packages/flash_attn_3-*.egg-info /flash_attn/; \
-        elif [ "$FLASH_ATTENTION_VERSION" -eq 4 ]; then \
-            case "$CUDA_VERSION" in \
-                12.6.1) OPTIONAL= ;; \
-                12.8.1) OPTIONAL= ;; \
-                12.9.1) OPTIONAL= ;; \
-                13.0.1) OPTIONAL=130 ;; \
-                *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
-            esac \
-            && pip install "flash-attn-4[$OPTIONAL]"; \
-        else \
-            echo "FLASH_ATTENTION_VERSIONS must be one of 2, 3, 4 but '$FLASH_ATTENTION_VERSION'" && exit 1; \
-        fi \
-    done
-
+    set -eux; \
+    mkdir -p /flash_attn/usr/local/lib/python3.12/dist-packages; \
+    for version in $(printf '%s' "$FLASH_ATTENTION_VERSIONS" | tr ',' ' '); do \
+        case "$version" in \
+            2) \
+                mkdir -p /tmp/flash-attn-2; \
+                python3 -m pip download \
+                    --no-build-isolation --no-deps --no-binary=:all: \
+                    --dest /tmp/flash-attn-2 \
+                    "flash-attn==$FLASH_ATTENTION_2_VERSION"; \
+                tar -xzf "/tmp/flash-attn-2/flash_attn-$FLASH_ATTENTION_2_VERSION.tar.gz" \
+                    -C /tmp/flash-attn-2; \
+                fa2_source="/tmp/flash-attn-2/flash_attn-$FLASH_ATTENTION_2_VERSION"; \
+                sed -i '/"flash_attn.egg-info",/a\            "flash_attn.cute.*",' "$fa2_source/setup.py"; \
+                sed -i '/"flash_attn.egg-info",/a\            "flash_attn.cute",' "$fa2_source/setup.py"; \
+                MAX_JOBS="$BUILD_AND_DOWNLOAD_PARALLEL" \
+                FLASH_ATTENTION_FORCE_BUILD="$FLASH_ATTENTION_FORCE_BUILD" \
+                    python3 -m pip install --root /flash_attn --no-build-isolation --no-deps "$fa2_source"; \
+                ;; \
+            3) \
+                git clone "https://$GITHUB_ARTIFACTORY/Dao-AILab/flash-attention.git" /tmp/flash-attn-3; \
+                git -C /tmp/flash-attn-3 checkout --detach "$FLASH_ATTENTION_3_COMMIT"; \
+                git -C /tmp/flash-attn-3 submodule update --init --recursive; \
+                MAX_JOBS="$BUILD_AND_DOWNLOAD_PARALLEL" \
+                FLASH_ATTENTION_FORCE_BUILD="$FLASH_ATTENTION_FORCE_BUILD" \
+                    python3 -m pip install --root /flash_attn --no-build-isolation --no-deps /tmp/flash-attn-3/hopper; \
+                ;; \
+            4) \
+                case "$CUDA_VERSION" in \
+                    12.6.1|12.8.1|12.9.1) extra="" ;; \
+                    13.0.1) extra="[cu13]" ;; \
+                    *) echo "Unsupported CUDA version: $CUDA_VERSION"; exit 1 ;; \
+                esac; \
+                python3 -m pip install --root /flash_attn -c /sgl-workspace/constraints.txt \
+                    "flash-attn-4${extra}==$FLASH_ATTENTION_4_VERSION"; \
+                ;; \
+            *) \
+                echo "FLASH_ATTENTION_VERSIONS must contain only 2, 3, or 4; got '$version'"; \
+                exit 1; \
+                ;; \
+        esac; \
+    done; \
+    if [ -n "$FLASH_ATTENTION_VERSIONS" ]; then \
+        PYTHONPATH=/flash_attn/usr/local/lib/python3.12/dist-packages python3 -m pip check; \
+    fi; \
+    rm -rf /tmp/flash-attn-2 /tmp/flash-attn-3
 
 ########################################################
 # PARALLEL STAGE 4: Dev Tools Builder (starts from base)
@@ -549,8 +574,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
-# Copy flash attention package
-COPY --from=fa_cache /flash_attn/ /usr/local/lib/python3.12/dist-packages/
+# Copy FlashAttention packages built in Stage 3
+COPY --from=fa_cache /flash_attn/usr/local/lib/python3.12/dist-packages/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -761,8 +786,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install SpecForge
 COPY --from=local_src /src /sgl-workspace/SpecForge
-RUN sed -i -e '/sglang==.*/d' -e '/transformers==.*/d' -e '/torch==.*/d' -e '/torchaudio==.*/d' -e '/torchvision==.*/d' /sgl-workspace/SpecForge/pyproject.toml \
-    && pip install -e /sgl-workspace/SpecForge
+RUN cd /sgl-workspace/SpecForge \
+    && sed -i -e '/sglang==.*/d' -e '/transformers==.*/d' -e '/torch==.*/d' -e '/torchaudio==.*/d' -e '/torchvision==.*/d' pyproject.toml \
+    && pip install -e '.[data]' \
+    && bash scripts/apply_sglang_spec_capture_patch.sh --target v${SGL_VERSION}
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -820,6 +848,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Python runtime
     python3.12-full \
     python3.12-dev \
+    python3-distro \
     wget \
     # Core system utilities
     ca-certificates \
@@ -905,9 +934,6 @@ COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
-# Copy torchrun binary
-COPY --from=framework_final /usr/local/bin/torchrun /usr/local/bin/torchrun
-
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
 COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
@@ -916,6 +942,17 @@ COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
 COPY --from=framework_final /usr/lib/libgdrapi.so* /usr/lib/
 COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
+
+# Copy torchrun binary
+COPY --from=framework_final /usr/local/bin/torchrun /usr/local/bin/torchrun
+
+# Copy mooncake binaries
+COPY --from=framework_final /usr/local/bin/mooncake_client /usr/local/bin/mooncake_client
+COPY --from=framework_final /usr/local/bin/mooncake_master /usr/local/bin/mooncake_master
+COPY --from=framework_final /usr/local/bin/mooncake_http_metadata_server /usr/local/bin/mooncake_http_metadata_server
+
+# Copy specforge binary
+COPY --from=framework_final /usr/local/bin/specforge /usr/local/bin/specforge
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so

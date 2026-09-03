@@ -5,7 +5,7 @@ A stub ``post_fn`` stands in for the patched SGLang server: it writes raw
 tensor bytes into the shared fake Mooncake backend at the sink's key layout
 (``{store_id}/{sample_id}/g{gen}/{name}``) and returns the
 ``meta_info["spec_capture"]`` result rows — i.e. it emulates
-``patches/sglang/v0.5.14/spec-capture.patch``'s ``SpecCaptureSink`` byte-for-
+``patches/sglang/v0.5.18/spec-capture.patch``'s ``SpecCaptureSink`` byte-for-
 byte. The tests then drive the REAL client stack over it:
 ``SGLangServerCaptureAdapter.produce_refs`` -> contract verification from
 FeatureSpecs -> ``MooncakeFeatureStore.adopt`` -> ``RolloutWorker`` commit ->
@@ -418,13 +418,19 @@ class TestServerCaptureAdapter(unittest.TestCase):
         # consume-once: released samples are physically freed
         self.assertFalse(any(backend._d))
 
-    def test_dflash_schema_names_and_no_target(self):
+    def test_dflash_schema_includes_teacher_hidden_for_metrics(self):
         backend, server, store, adapter = _mk(algorithm="dflash")
         refs = adapter.produce_refs([_task(0, 5)], capture=_dflash_contract())
         (ref,) = refs
         self.assertIsInstance(ref, SampleRef)
         self.assertEqual(
-            sorted(ref.feature_specs), ["hidden_states", "input_ids", "loss_mask"]
+            sorted(ref.feature_specs),
+            [
+                "hidden_states",
+                "input_ids",
+                "loss_mask",
+                "target_last_hidden_states",
+            ],
         )
         self.assertEqual(
             ref.feature_specs["hidden_states"].shape,
@@ -433,6 +439,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertEqual(ref.feature_specs["loss_mask"].shape, (1, 5))
         out, _ = store.get(ref)
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
+        self.assertEqual(out["target_last_hidden_states"].shape, (1, 5, HIDDEN))
 
     def test_dspark_schema_includes_target_last_hidden(self):
         backend, server, store, adapter = _mk(algorithm="dspark")

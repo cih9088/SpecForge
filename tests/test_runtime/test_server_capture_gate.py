@@ -20,7 +20,7 @@ What is pinned here:
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
 GPU, sglang patched with
-``patches/sglang/v0.5.14/spec-capture.patch`` (see
+``patches/sglang/v0.5.18/spec-capture.patch`` (see
 ``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
 a reachable/spawnable ``mooncake_master``; opt in locally with
 ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
@@ -83,7 +83,7 @@ class TestServerCaptureGate(unittest.TestCase):
         if not _patched_sglang():
             raise unittest.SkipTest(
                 "installed sglang lacks spec_capture_sink — apply "
-                "patches/sglang/v0.5.14/spec-capture.patch "
+                "patches/sglang/v0.5.18/spec-capture.patch "
                 "(scripts/apply_sglang_spec_capture_patch.sh)"
             )
         if not _mooncake_available():
@@ -417,8 +417,17 @@ class TestServerCaptureGate(unittest.TestCase):
         (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
         self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
         out, handle = store.get(ref)
-        self.assertEqual(sorted(out), ["hidden_states", "input_ids", "loss_mask"])
+        self.assertEqual(
+            sorted(out),
+            [
+                "hidden_states",
+                "input_ids",
+                "loss_mask",
+                "target_last_hidden_states",
+            ],
+        )
         self.assertEqual(out["hidden_states"].shape, (1, 5, len(AUX_LAYER_IDS) * H))
+        self.assertEqual(out["target_last_hidden_states"].shape, (1, 5, H))
         aux_ref, _ = self._hf_reference(rows)
         torch.testing.assert_close(
             out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL

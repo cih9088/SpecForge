@@ -228,9 +228,10 @@ async def call_sglang(
     server_address: str,
     data: List[Dict[str, Any]],
     max_tokens=None,
+    *,
+    client: AsyncOpenAI,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
-    client = AsyncOpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]
     regenerated_messages = []
@@ -362,6 +363,14 @@ async def main():
             print(f"All {total_lines} samples already processed. Nothing to do.")
             return
 
+    server_clients = {
+        server_address: AsyncOpenAI(
+            base_url=f"http://{server_address}/v1",
+            api_key="None",
+        )
+        for server_address in dict.fromkeys(args.server_address)
+    }
+
     # test all server addresses
     valid_server_addresses = []
     for server_address in args.server_address:
@@ -373,6 +382,7 @@ async def main():
             server_address,
             dummy_data,
             max_tokens=1,
+            client=server_clients[server_address],
         )
         if result is not None and result.get("status") == "success":
             valid_server_addresses.append(server_address)
@@ -380,6 +390,9 @@ async def main():
             print(f"Server {server_address} is not available")
 
     if len(valid_server_addresses) == 0:
+        await asyncio.gather(
+            *(client.close() for client in server_clients.values())
+        )
         raise ValueError("No server address is available")
     print(
         f"Using {len(valid_server_addresses)} server addresses: {valid_server_addresses}"
@@ -402,23 +415,26 @@ async def main():
     error_samples = 0
     skipped_samples = 0
 
-    semaphore = asyncio.Semaphore(args.concurrency * len(valid_server_addresses))
+    server_semaphores = {
+        server_address: asyncio.Semaphore(args.concurrency)
+        for server_address in valid_server_addresses
+    }
+    max_pending_tasks = args.concurrency * len(valid_server_addresses)
 
     # Use a lock to protect file writes and shared counters
     write_lock = asyncio.Lock()
 
-    output_file_handle = open(args.output_file_path, file_mode)
-    error_file_handle = open(error_file_path, file_mode)
-    skipped_file_handle = open(skipped_file_path, file_mode)
-
-    pbar = tqdm(total=total_lines, desc="Processing", initial=len(processed_ids))
-
     async def process_item(data, server_address):
         nonlocal context_token_sum, context_token_min, context_token_max
-        nonlocal success_samples, error_samples
+        nonlocal success_samples, error_samples, skipped_samples
 
-        async with semaphore:
-            regen_data = await call_sglang(args, server_address, data)
+        async with server_semaphores[server_address]:
+            regen_data = await call_sglang(
+                args,
+                server_address,
+                data,
+                client=server_clients[server_address],
+            )
 
         async with write_lock:
             if regen_data["status"] == "error":
@@ -448,15 +464,25 @@ async def main():
                 success_samples += 1
             pbar.update(1)
 
-    # Create all tasks
-    tasks = []
+    pending_tasks: set[asyncio.Task] = set()
+    submitted_samples = 0
     start_server_index = 0
 
-    with open(args.input_file_path, "r") as input_file:
+    with (
+        open(args.input_file_path, "r") as input_file,
+        open(args.output_file_path, file_mode) as output_file_handle,
+        open(error_file_path, file_mode) as error_file_handle,
+        open(skipped_file_path, file_mode, encoding="utf-8") as skipped_file_handle,
+        tqdm(
+            total=total_lines,
+            desc="Processing",
+            initial=len(processed_ids),
+        ) as pbar,
+    ):
         for line in input_file:
             if (
                 args.num_samples is not None
-                and len(tasks) >= args.num_samples
+                and submitted_samples >= args.num_samples
             ):
                 break
 
@@ -479,16 +505,25 @@ async def main():
                 valid_server_addresses
             )
 
-            tasks.append(process_item(data, server_address))
+            pending_tasks.add(
+                asyncio.create_task(process_item(data, server_address))
+            )
+            submitted_samples += 1
 
-    # Run all tasks concurrently (semaphore limits actual concurrency)
-    await asyncio.gather(*tasks)
+            if len(pending_tasks) >= max_pending_tasks:
+                done, pending_tasks = await asyncio.wait(
+                    pending_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    task.result()
 
-    output_file_handle.close()
-    error_file_handle.close()
-    skipped_file_handle.close()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks)
 
-    pbar.close()
+    await asyncio.gather(
+        *(client.close() for client in server_clients.values())
+    )
 
     print(f"\nProcessing completed!")
     if success_samples > 0:
@@ -501,7 +536,7 @@ async def main():
     else:
         print("No successful examples to compute context length statistics.")
 
-    total_processed = success_samples + error_samples
+    total_processed = success_samples + error_samples + skipped_samples
     previously = len(processed_ids)
     if previously > 0:
         print(f"\nResume processing completed!")

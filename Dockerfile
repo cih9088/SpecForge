@@ -745,10 +745,12 @@ RUN cd /sgl-workspace/SpecForge \
         -e '/torchvision==.*/d' \
         pyproject.toml \
     && python3 -m pip install -e '.[data]' \
-    && cp scripts/apply_sglang_spec_capture_patch.sh /tmp/apply_patch.sh \
-    && sed -i 's/-p2/-p1/g' /tmp/apply_patch.sh \
     && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/spec-capture.patch \
-        bash /tmp/apply_patch.sh --target v0.5.18
+        bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 \
+    && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/qwen3.5-eagle3.patch \
+        bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 \
+    && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/dflash2.patch \
+        bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

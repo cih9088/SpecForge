@@ -1,0 +1,14 @@
+---
+FROM https://github.com/sgl-project/sglang/pull/35809
+diff --git a/python/sglang/srt/models/gemma4_unified.py b/python/sglang/srt/models/gemma4_unified.py
+index 67d0771d4aea..e02745816ed3 100644
+--- a/python/sglang/srt/models/gemma4_unified.py
++++ b/python/sglang/srt/models/gemma4_unified.py
+@@ -192,4 +192,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
+         text_tie = getattr(text_config, "tie_word_embeddings", True)
+-        if self.pp_group.world_size == 1 and text_tie:
++        # The tower-based parent's forward() reads lm_head_is_tied.
++        self.lm_head_is_tied = self.pp_group.world_size == 1 and text_tie
++        if self.lm_head_is_tied:
+             self.lm_head = self.language_model.embed_tokens
+         elif self.pp_group.is_last_rank:

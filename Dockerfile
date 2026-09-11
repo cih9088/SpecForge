@@ -750,6 +750,8 @@ RUN cd /sgl-workspace/SpecForge \
     && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/qwen3.5-eagle3.patch \
         bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 \
     && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/dflash2.patch \
+        bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 \
+    && SPECFORGE_SPEC_CAPTURE_PATCH=/sgl-workspace/SpecForge/patches/sglang/v0.5.18/gemma4-unified-lm-head-is-tied.patch \
         bash scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18
 
 # Set workspace directory

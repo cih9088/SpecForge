@@ -14,7 +14,7 @@ import random
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 DATASETS: dict[str, dict[str, Any]] = {
@@ -66,6 +66,12 @@ class BenchmarkResult:
     throughput_tokens_per_second: float
     average_acceptance_length: Optional[float] = None
     spec_verify_count: Optional[int] = None
+    mean_request_latency_seconds: Optional[float] = None
+    p50_request_latency_seconds: Optional[float] = None
+    p95_request_latency_seconds: Optional[float] = None
+    std_request_latency_seconds: Optional[float] = None
+    std_output_tokens_per_request: Optional[float] = None
+    config: dict[str, Any] = field(default_factory=dict)
 
 
 def _load_prompts(name: str, max_samples: Optional[int]) -> list[list[str]]:
@@ -125,7 +131,15 @@ def _send_sglang(args, prompt: str) -> dict[str, Any]:
     return payload[0] if isinstance(payload, list) else payload
 
 
+def _timed_request(args, prompt: str) -> tuple[dict[str, Any], float]:
+    # Called inside the worker, excluding time in the executor's local queue.
+    start = time.perf_counter()
+    output = _send_sglang(args, prompt)
+    return output, time.perf_counter() - start
+
+
 def _run_sglang(args) -> BenchmarkResult:
+    import numpy as np
     import requests
     from transformers import AutoTokenizer
 
@@ -168,13 +182,19 @@ def _run_sglang(args) -> BenchmarkResult:
     total_tokens = 0
     verify_count = 0
     acceptance_lengths: list[float] = []
+    request_latencies: list[float] = []
+    output_lengths: list[int] = []
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [executor.submit(_send_sglang, args, prompt) for prompt in prompts]
+        futures = [executor.submit(_timed_request, args, prompt) for prompt in prompts]
         for future in as_completed(futures):
-            output = future.result()
+            output, request_latency = future.result()
+            request_latencies.append(request_latency)
             metadata = output.get("meta_info", {}) or {}
-            total_tokens += int(metadata.get("completion_tokens", 0))
+            completion_tokens = metadata.get("completion_tokens")
+            if completion_tokens is not None:
+                output_lengths.append(int(completion_tokens))
+                total_tokens += int(completion_tokens)
             verify_count += int(metadata.get("spec_verify_ct", 0))
             if metadata.get("spec_accept_length") is not None:
                 try:
@@ -193,6 +213,32 @@ def _run_sglang(args) -> BenchmarkResult:
             statistics.fmean(acceptance_lengths) if acceptance_lengths else None
         ),
         spec_verify_count=verify_count or None,
+        mean_request_latency_seconds=statistics.fmean(request_latencies),
+        p50_request_latency_seconds=float(
+            np.percentile(request_latencies, 50, method="linear")
+        ),
+        p95_request_latency_seconds=float(
+            np.percentile(request_latencies, 95, method="linear")
+        ),
+        std_request_latency_seconds=float(np.std(request_latencies, ddof=0)),
+        std_output_tokens_per_request=(
+            float(np.std(output_lengths, ddof=0))
+            if len(output_lengths) == prompt_count else None
+        ),
+        config={
+            name: getattr(args, name, None)
+            for name in (
+                "model",
+                "concurrency",
+                "max_new_tokens",
+                "num_prompts",
+                "max_samples",
+                "temperature",
+                "top_p",
+                "top_k",
+                "enable_thinking",
+            )
+        },
     )
 
 
@@ -200,6 +246,19 @@ def _print_result(result: BenchmarkResult) -> None:
     print(f"Backend: {result.backend}")
     print(f"Dataset: {result.dataset} ({result.samples} completed prompts/turns)")
     print(f"Output throughput: {result.throughput_tokens_per_second:.2f} tok/s")
+    print(f"Total benchmark duration: {result.latency_seconds:.3f} s")
+    for label, value in (
+        ("Mean", result.mean_request_latency_seconds),
+        ("p50", result.p50_request_latency_seconds),
+        ("p95", result.p95_request_latency_seconds),
+        ("Std", result.std_request_latency_seconds),
+    ):
+        if value is not None:
+            print(f"{label} request latency: {value:.3f} s")
+    if result.std_output_tokens_per_request is not None:
+        print(f"Output tokens per request std: {result.std_output_tokens_per_request:.3f}")
+    else:
+        print("Output tokens per request std: unavailable")
     if result.average_acceptance_length is not None:
         print(f"Average acceptance length: {result.average_acceptance_length:.3f}")
     if result.spec_verify_count is not None:

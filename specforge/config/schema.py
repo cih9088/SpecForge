@@ -998,12 +998,14 @@ class Config(StrictConfigModel):
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
     """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+    # Validate paths against defaults without marking them explicitly set.
+    resolved = config.model_dump()
+    raw = config.model_dump(exclude_unset=True)
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
-        node = raw
+        node = resolved
         keys = path.split(".")
         for key in keys[:-1]:
             if not isinstance(node.get(key), dict):
@@ -1022,6 +1024,10 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                     f"override {path!r} contains an invalid structured value"
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
+        explicit_node = raw
+        for key in keys[:-1]:
+            explicit_node = explicit_node.setdefault(key, {})
+        explicit_node[keys[-1]] = value
     return Config.model_validate(raw)
 
 

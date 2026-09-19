@@ -125,8 +125,6 @@ class TestNormalizeDFlashExport(unittest.TestCase):
                         "block_size": 16,
                         "dflash_config": {
                             "projector_type": "domino",
-                        },
-                        "domino_config": {
                             "gru_hidden_dim": 1024,
                         },
                     }
@@ -154,14 +152,12 @@ class TestNormalizeDFlashExport(unittest.TestCase):
                         "model_type": "qwen3",
                         "dflash_config": {
                             "projector_type": "dspark",
-                            "mask_token_id": 248070,
-                            "target_layer_ids": [2, 17, 32, 47, 62],
-                        },
-                        "dspark_config": {
                             "markov_rank": 256,
                             "markov_head_type": "vanilla",
                             "enable_confidence_head": True,
                             "confidence_head_with_markov": True,
+                            "mask_token_id": 248070,
+                            "target_layer_ids": [2, 17, 32, 47, 62],
                         },
                     }
                 ),

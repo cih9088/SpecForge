@@ -332,6 +332,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
+    #: None selects CUDA publication on RDMA in the capture worker.
+    gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
 
@@ -377,6 +379,14 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        if any(server.gpu_put for server in self.capture_servers) and (
+            self.mooncake.protocol != "rdma"
+        ):
+            raise ValueError(
+                "managed_local capture_servers[].gpu_put needs mooncake.protocol "
+                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
+                "device memory"
+            )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
             raise ValueError(
@@ -438,7 +448,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: a bounded pool of page-locked, once-registered host buffers and copies to
     #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
     #: for device reads (Mooncake 0.3.x stages these through its client buffer).
-    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pageable"
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pinned"
     #: Retained receive-pool budget per rank; excludes output copies and overflow.
     receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
